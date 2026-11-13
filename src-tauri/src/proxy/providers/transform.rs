@@ -291,6 +291,15 @@ pub fn anthropic_to_openai_with_reasoning_content(
         }
     }
 
+    // 严格 OpenAI 兼容后端（Xinference / vllm / sglang 等）要求 role=system 只能
+    // 出现在 messages 首位，中途 system 直接 400（"System message must be at the
+    // beginning"）。先把 content 为数组的 system 压平，使 collapse 能识别（它只认
+    // content 为字符串的 system）；再把中途 system 归并/改写，使 messages 只剩首条
+    // system。接受中途 system 的后端（OpenRouter 等）会损失中途 system 之后的前缀
+    // 缓存，属可接受代价。复用 MiniMax 场景已验证的 `collapse_system_messages_to_head`。
+    flatten_system_array_content(&mut messages);
+    let messages = super::transform_codex_chat::collapse_system_messages_to_head(messages);
+
     result["messages"] = json!(messages);
 
     // 转换参数 — o-series 模型需要 max_completion_tokens
@@ -416,6 +425,38 @@ fn map_tool_choice_to_chat(tool_choice: &Value) -> Value {
             _ => tool_choice.clone(),
         },
         _ => tool_choice.clone(),
+    }
+}
+
+/// 把 messages 里 content 为数组的 system 消息压平成字符串，使
+/// `collapse_system_messages_to_head` 能识别（它只认 content 为字符串的 system）。
+/// 顶层 `system` 字段已在转换时合并进首条，这里只处理 messages 里注入的中途 system。
+/// 含非 text block（如图片）的不压平——合并会丢内容，原位改写为 user 保内容不丢角色合规。
+fn flatten_system_array_content(messages: &mut [Value]) {
+    for msg in messages.iter_mut() {
+        if msg.get("role").and_then(Value::as_str) != Some("system") {
+            continue;
+        }
+        let Some(blocks) = msg.get("content").and_then(Value::as_array).cloned() else {
+            continue;
+        };
+        let texts: Option<Vec<&str>> = blocks
+            .iter()
+            .map(|b| {
+                (b.get("type").and_then(Value::as_str) == Some("text"))
+                    .then(|| b.get("text").and_then(Value::as_str))
+                    .flatten()
+            })
+            .collect();
+        match texts {
+            Some(texts) => {
+                msg["content"] = json!(texts.join("\n"));
+            }
+            None => {
+                log::debug!("[Transform] 中途 system 含非 text block，原位改写为 user");
+                msg["role"] = json!("user");
+            }
+        }
     }
 }
 
@@ -1114,9 +1155,11 @@ mod tests {
     }
 
     #[test]
-    fn test_anthropic_to_openai_preserves_mid_conversation_system_in_place() {
-        // Claude Code 会在对话中间注入 system 消息（如 <total_tokens>），
-        // 必须保持原位，不合并不上提，否则破坏前缀缓存。
+    fn test_anthropic_to_openai_rewrites_mid_conversation_system_for_strict_backends() {
+        // Claude Code 会在对话中间注入 system 消息（如 <total_tokens>）。
+        // 严格 OpenAI 兼容后端（Xinference / vllm / sglang 等）要求 role=system
+        // 只能出现在 messages 首位，否则 400 "System message must be at the beginning"。
+        // 回合边界的中途 system 原位改写为 user（保前面前缀），不再以 system 角色出现。
         let input = json!({
             "model": "claude-3-sonnet",
             "max_tokens": 1024,
@@ -1136,15 +1179,122 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "You are Claude Code.");
 
-        // 中途 system 保持原位（第 3 条，index=3），不被合并或上提
-        assert_eq!(messages[3]["role"], "system");
+        // 首位之外不允许再出现 system 角色
+        for msg in &messages[1..] {
+            assert_ne!(msg["role"].as_str(), Some("system"));
+        }
+
+        // 回合边界的中途 system 原位改写为 user（index=3），文本不变
+        assert_eq!(messages[3]["role"], "user");
         assert_eq!(
             messages[3]["content"],
             "<total_tokens>14963538 tokens left</total_tokens>"
         );
 
-        // 总共 5 条消息，没有合并
         assert_eq!(messages.len(), 5);
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_merges_tool_loop_system_into_head() {
+        // 工具循环中途的 system（夹在 tool_use 与 tool_result 之间）不能原位转
+        // user——会把一次工具循环拆成两个回合。应拼进首条 system。
+        let input = json!({
+            "model": "claude-3-sonnet",
+            "max_tokens": 1024,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role": "user", "content": "Read the file"},
+                {"role": "assistant", "content": [
+                    {"type": "tool_use", "id": "t1", "name": "read", "input": {}}
+                ]},
+                {"role": "system", "content": "Media was scaled down."},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                ]}
+            ]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        // 首位之外不允许再出现 system 角色
+        for msg in &messages[1..] {
+            assert_ne!(msg["role"].as_str(), Some("system"));
+        }
+
+        // 工具循环里的 system 已拼进首条
+        let head = messages[0]["content"].as_str().unwrap();
+        assert!(head.starts_with("You are Claude Code."));
+        assert!(head.contains("Media was scaled down."));
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_flattens_mid_system_with_text_array_content() {
+        // 多 text block 的 system 经 convert 后 content 仍是数组，collapse 只认字符串；
+        // flatten 先压平成 "A\nB"，再按回合边界改写为 user，首位外不再有 system。
+        let input = json!({
+            "model": "claude-3-sonnet",
+            "max_tokens": 1024,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "Notice one."},
+                        {"type": "text", "text": "Notice two."}
+                    ]
+                },
+                {"role": "user", "content": "Continue"}
+            ]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        for msg in &messages[1..] {
+            assert_ne!(msg["role"].as_str(), Some("system"));
+        }
+
+        // 原位改写为 user，两段文本压平成 "Notice one.\nNotice two."
+        assert_eq!(messages[3]["role"], "user");
+        assert_eq!(messages[3]["content"], "Notice one.\nNotice two.");
+    }
+
+    #[test]
+    fn test_anthropic_to_openai_rewrites_mid_system_with_non_text_block_to_user() {
+        // 含非 text block（图片）的中途 system 不能压平进头部——会丢内容。
+        // flatten 原位改写为 user，图片块保留。
+        let input = json!({
+            "model": "claude-3-sonnet",
+            "max_tokens": 1024,
+            "system": "You are Claude Code.",
+            "messages": [
+                {"role": "user", "content": "Hello"},
+                {"role": "assistant", "content": "Hi!"},
+                {
+                    "role": "system",
+                    "content": [
+                        {"type": "text", "text": "See this image."},
+                        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "AAA"}}
+                    ]
+                },
+                {"role": "user", "content": "Continue"}
+            ]
+        });
+
+        let result = anthropic_to_openai(input).unwrap();
+        let messages = result["messages"].as_array().unwrap();
+
+        for msg in &messages[1..] {
+            assert_ne!(msg["role"].as_str(), Some("system"));
+        }
+
+        // 改写为 user 后，图片块仍在（未丢内容）
+        assert_eq!(messages[3]["role"], "user");
+        let content = messages[3]["content"].as_array().unwrap();
+        assert!(content.iter().any(|p| p["type"] == "image_url"));
     }
 
     #[test]

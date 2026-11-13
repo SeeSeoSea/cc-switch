@@ -589,7 +589,7 @@ fn zen_effort_rank(effort: &str) -> Option<u8> {
 ///   改动已经发过的前缀，上游前缀缓存从第一条消息断开，整段对话重算。
 /// - 其余中途 system（夹在工具调用循环里，如图片缩放提示）仍拼进首条：原位插 user
 ///   会把一次工具循环拆成两个回合，影响 DeepSeek / Kimi 等的推理连续性。
-fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
+pub(super) fn collapse_system_messages_to_head(messages: Vec<Value>) -> Vec<Value> {
     // 每条消息之后第一条非 system 消息是否为 user。
     let mut followed_by_user = vec![false; messages.len()];
     let mut next_is_user = false;
